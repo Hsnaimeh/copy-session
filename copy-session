@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Copy part or all of a Claude Code session to the clipboard, as readable text.
+#
+# Why this lives outside Claude Code: /export already copies the whole
+# conversation for free, because it is a client-side command with no model
+# call. A custom slash command would be a PROMPT command and would cost
+# tokens every time you ran it. This costs none, and does the narrower
+# things /export cannot.
+#
+# WHAT                                  HOW
+#   copy-session                        the whole session
+#   copy-session -r                     the last assistant response
+#   copy-session -u                     the last thing you typed
+#   copy-session -n 6                   the last 6 messages
+#   copy-session -c                      every ``` block of the last response
+#   copy-session -s "gate"              messages matching a pattern
+#
+# WHICH SESSION                         (any mode takes these)
+#   -l                                  list this project's sessions
+#   -i <id|n>                           a session id, or n back from newest.
+#                                       Without it: the session you are IN
+#                                       (CLAUDE_CODE_SESSION_ID), else newest.
+#   -o <file>                           write a file instead of copying
+#   -p                                  print to stdout
+#   -t                                  include tool calls and results
+set -euo pipefail
+
+DIR="$HOME/.claude/projects/$(printf '%s' "$PWD" | sed 's#[/.]#-#g')"
+[ -d "$DIR" ] || { echo "no sessions recorded for $PWD" >&2; exit 1; }
+
+mode=all pick=1 out="" to_stdout=0 tools=0 count=0 pattern="" explicit=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -l|--list)
+      ls -t "$DIR"/*.jsonl 2>/dev/null | nl -w2 -s'  ' | while read -r n f; do
+        printf '%2s  %s  %6sKB  %s\n' "$n" "$(date -r "$f" '+%Y-%m-%d %H:%M')" \
+          "$(( $(stat -f%z "$f" 2>/dev/null || stat -c%s "$f") / 1024 ))" "$(basename "$f" .jsonl)"
+      done
+      exit 0 ;;
+    -r|--response)  mode=last_assistant; shift ;;
+    -u|--user)      mode=last_user; shift ;;
+    -c|--code)      mode=code; shift ;;
+    -n|--last)      mode=tail; count="$2"; shift 2 ;;
+    -s|--search)    mode=search; pattern="$2"; shift 2 ;;
+    -i|--session)   pick="$2"; explicit=1; shift 2 ;;
+    -o|--out)       out="$2"; shift 2 ;;
+    -p|--print)     to_stdout=1; shift ;;
+    -t|--tools)     tools=1; shift ;;
+    -h|--help)      sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)              pick="$1"; explicit=1; shift ;;
+  esac
+done
+
+# THE SESSION YOU ARE IN, not the newest file. Claude Code exports its own id,
+# and with two sessions open in one project the newest .jsonl is whichever one
+# wrote last - which is how this first returned another session's answer.
+# An explicit -i always wins.
+if [ "$explicit" = 0 ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] \
+   && [ -f "$DIR/$CLAUDE_CODE_SESSION_ID.jsonl" ]; then
+  FILE="$DIR/$CLAUDE_CODE_SESSION_ID.jsonl"
+elif [[ "$pick" =~ ^[0-9]+$ ]]; then
+  FILE=$(ls -t "$DIR"/*.jsonl 2>/dev/null | sed -n "${pick}p")
+else
+  FILE="$DIR/$pick.jsonl"
+fi
+[ -f "${FILE:-}" ] || { echo "no such session: $pick" >&2; exit 1; }
+
+render() {
+python3 - "$FILE" "$mode" "$count" "$pattern" "$tools" <<'PY'
+import sys, json, re
+
+path, mode, count, pattern, tools = sys.argv[1:6]
+count, tools = int(count or 0), tools == '1'
+
+def text(content):
+    if isinstance(content, str):
+        return content
+    out = []
+    for b in content or []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get('type')
+        if t == 'text':
+            out.append(b.get('text', ''))
+        elif t == 'tool_use' and tools:
+            i = b.get('input') or {}
+            hint = i.get('command') or i.get('file_path') or i.get('pattern') or i.get('url') or ''
+            out.append(f"[tool: {b.get('name')}] {str(hint)[:200]}")
+        elif t == 'tool_result' and tools:
+            c = b.get('content')
+            s = c if isinstance(c, str) else ' '.join(
+                x.get('text', '') for x in (c or []) if isinstance(x, dict))
+            s = ' '.join(s.split())
+            out.append(f"[result] {s[:400]}{'...' if len(s) > 400 else ''}")
+    return '\n'.join(x for x in out if x)
+
+msgs = []
+for line in open(path, errors='replace'):
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if d.get('type') not in ('user', 'assistant'):
+        continue
+    m = d.get('message') or {}
+    body = text(m.get('content')).strip()
+    if body:
+        msgs.append((m.get('role', '?'), body))
+
+# A session with no plain prose is a real answer, not an error to hide.
+if not msgs:
+    sys.exit('nothing to copy: no text messages in this session')
+
+def emit(rows, headers=True):
+    for role, body in rows:
+        print(f"## {role}\n\n{body}\n" if headers else body)
+
+if mode == 'all':
+    emit(msgs)
+elif mode == 'last_assistant':
+    r = [m for m in msgs if m[0] == 'assistant']
+    if not r: sys.exit('no assistant message in this session')
+    emit(r[-1:], headers=False)
+elif mode == 'last_user':
+    r = [m for m in msgs if m[0] == 'user']
+    if not r: sys.exit('no user message in this session')
+    emit(r[-1:], headers=False)
+elif mode == 'tail':
+    emit(msgs[-count:] if count else msgs)
+elif mode == 'code':
+    r = [m for m in msgs if m[0] == 'assistant']
+    if not r: sys.exit('no assistant message in this session')
+    blocks = re.findall(r'```[^\n]*\n(.*?)```', r[-1][1], re.S)
+    if not blocks: sys.exit('the last response has no code blocks')
+    print('\n'.join(b.rstrip() for b in blocks))
+elif mode == 'search':
+    rx = re.compile(pattern, re.I)
+    hits = [m for m in msgs if rx.search(m[1])]
+    if not hits: sys.exit(f'no message matches {pattern!r}')
+    emit(hits)
+PY
+}
+
+# Whatever this machine calls the clipboard. Checked in the order that gives
+# the right answer on a Mac, a Wayland desktop, X11, and WSL.
+clip_cmd() {
+  if   command -v pbcopy      >/dev/null 2>&1; then echo pbcopy
+  elif command -v wl-copy     >/dev/null 2>&1; then echo wl-copy
+  elif command -v xclip       >/dev/null 2>&1; then echo "xclip -selection clipboard"
+  elif command -v xsel        >/dev/null 2>&1; then echo "xsel --clipboard --input"
+  elif command -v clip.exe    >/dev/null 2>&1; then echo clip.exe
+  else return 1
+  fi
+}
+
+label=$(basename "$FILE" .jsonl)
+if [ -n "$out" ]; then
+  render > "$out"; echo "wrote $out  ($(wc -l < "$out" | tr -d ' ') lines, from $label)"
+elif [ "$to_stdout" = 1 ]; then
+  render
+else
+  if ! CLIP=$(clip_cmd); then
+    echo "no clipboard tool found (pbcopy, wl-copy, xclip, xsel, clip.exe)." >&2
+    echo "use -p to print or -o <file> to write instead." >&2
+    exit 1
+  fi
+  body=$(render); printf '%s' "$body" | $CLIP
+  echo "copied ${#body} chars from $label"
+fi
